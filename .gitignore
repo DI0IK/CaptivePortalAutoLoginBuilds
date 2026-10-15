@@ -1,0 +1,5 @@
+keystore.jks
+*.jks
+*.keystore
+keystore.properties
+nightly.keystore
