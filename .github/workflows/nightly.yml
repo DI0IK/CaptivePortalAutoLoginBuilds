@@ -132,9 +132,11 @@ jobs:
         run: |
           set -euo pipefail
           OUT_DIR="app/build/outputs/apk/arm64/release"
-          VERSION_NAME="$(jq -r '.versionName' "$OUT_DIR/output-metadata.json")"
+          META="$OUT_DIR/output-metadata.json"
+          VERSION_NAME="$(jq -r '.elements[0].versionName // .versionName // "unknown"' "$META")"
+          BUILD_APK="$(jq -r '.elements[0].outputFile' "$META")"
           APK="CaptivePortalAutoLogin-${VERSION_NAME}-arm64.apk"
-          cp "$OUT_DIR/app-arm64-release.apk" "$APK"
+          cp "$OUT_DIR/$BUILD_APK" "$APK"
           echo "version_name=$VERSION_NAME" >> "$GITHUB_OUTPUT"
           echo "path=$APK" >> "$GITHUB_OUTPUT"
           echo "Built $APK (versionName=$VERSION_NAME)"
