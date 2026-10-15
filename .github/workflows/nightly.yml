@@ -1,0 +1,175 @@
+name: Nightly Release
+
+on:
+  schedule:
+    - cron: '23 2 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Build and publish even if there are no changes
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: nightly
+  cancel-in-progress: false
+
+env:
+  SOURCE_REPO: binarynoise/CaptivePortalAutoLogin
+  SOURCE_REF: main
+
+jobs:
+  nightly:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout source repository
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ env.SOURCE_REF }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Detect changes since last nightly
+        id: changes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+          SHA="$(git rev-parse HEAD)"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          if [ "$FORCE" = "true" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "Forced build for $SOURCE_REPO@$SHA"
+          elif gh release view "nightly-$SHA" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "No changes since last nightly ($SHA)"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "Changes detected ($SHA)"
+          fi
+
+      - name: Set up JDK 17
+        if: steps.changes.outputs.changed == 'true'
+        uses: actions/setup-java@v6
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Set up Gradle
+        if: steps.changes.outputs.changed == 'true'
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Ensure Android SDK platform 36
+        if: steps.changes.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          if [ -d "${ANDROID_HOME:?}/platforms/android-36" ]; then
+            echo "platforms;android-36 already present"
+            exit 0
+          fi
+          SDKMANAGER="$(command -v sdkmanager || true)"
+          if [ -z "$SDKMANAGER" ]; then
+            for candidate in "$ANDROID_HOME"/cmdline-tools/*/bin/sdkmanager; do
+              if [ -x "$candidate" ]; then
+                SDKMANAGER="$candidate"
+                break
+              fi
+            done
+          fi
+          if [ -z "$SDKMANAGER" ]; then
+            echo "::error::sdkmanager not found"
+            exit 1
+          fi
+          yes | "$SDKMANAGER" --licenses > /dev/null || true
+          "$SDKMANAGER" "platforms;android-36"
+
+      - name: Ensure local.properties exists
+        if: steps.changes.outputs.changed == 'true'
+        run: touch local.properties
+
+      - name: Decode release keystore
+        if: steps.changes.outputs.changed == 'true'
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_STORE_PASSWORD: ${{ secrets.KEYSTORE_STORE_PASSWORD }}
+          KEYSTORE_KEY_ALIAS: ${{ secrets.KEYSTORE_KEY_ALIAS }}
+          KEYSTORE_KEY_PASSWORD: ${{ secrets.KEYSTORE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "$KEYSTORE_BASE64" ]; then
+            echo "::warning::KEYSTORE_BASE64 is not set - the APK will be signed with the debug key"
+            exit 0
+          fi
+          if [ -z "$KEYSTORE_STORE_PASSWORD" ] || [ -z "$KEYSTORE_KEY_ALIAS" ] || [ -z "$KEYSTORE_KEY_PASSWORD" ]; then
+            echo "::error::KEYSTORE_BASE64 is set but KEYSTORE_STORE_PASSWORD, KEYSTORE_KEY_ALIAS or KEYSTORE_KEY_PASSWORD is missing"
+            exit 1
+          fi
+          printf '%s' "$KEYSTORE_BASE64" | base64 -d > nightly.keystore
+          {
+            printf 'storeFile=%s\n' 'nightly.keystore'
+            printf 'storePassword=%s\n' "${KEYSTORE_STORE_PASSWORD//\\/\\\\}"
+            printf 'keyAlias=%s\n' "${KEYSTORE_KEY_ALIAS//\\/\\\\}"
+            printf 'keyPassword=%s\n' "${KEYSTORE_KEY_PASSWORD//\\/\\\\}"
+          } > keystore.properties
+          echo "keystore.properties written (storeFile=nightly.keystore)"
+
+      - name: Build ARM64 release APK
+        if: steps.changes.outputs.changed == 'true'
+        run: |
+          chmod +x gradlew
+          ./gradlew :app:assembleArm64Release --stacktrace
+
+      - name: Collect APK
+        id: apk
+        if: steps.changes.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          OUT_DIR="app/build/outputs/apk/arm64/release"
+          VERSION_NAME="$(jq -r '.versionName' "$OUT_DIR/output-metadata.json")"
+          APK="CaptivePortalAutoLogin-${VERSION_NAME}-arm64.apk"
+          cp "$OUT_DIR/app-arm64-release.apk" "$APK"
+          echo "version_name=$VERSION_NAME" >> "$GITHUB_OUTPUT"
+          echo "path=$APK" >> "$GITHUB_OUTPUT"
+          echo "Built $APK (versionName=$VERSION_NAME)"
+
+      - name: Publish nightly release
+        if: steps.changes.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ steps.changes.outputs.sha }}
+          VERSION_NAME: ${{ steps.apk.outputs.version_name }}
+          APK: ${{ steps.apk.outputs.path }}
+        run: |
+          set -euo pipefail
+          TAG="nightly-$SHA"
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release delete "$TAG" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag
+          fi
+          PREV_TAG="$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" --jq '[.[] | select(.tag_name | startswith("nightly-"))][0].tag_name // ""')"
+          PREV_SHA="${PREV_TAG#nightly-}"
+          {
+            echo "Built from [$SOURCE_REPO@$SHA](https://github.com/$SOURCE_REPO/commit/$SHA)"
+            echo
+            echo "versionName: \`$VERSION_NAME\`"
+            if [ -n "$PREV_SHA" ] && [ "$PREV_SHA" != "$SHA" ]; then
+              echo
+              echo "### Changes since last nightly"
+              echo
+              git log --oneline --no-decorate "$PREV_SHA..$SHA" | head -100 || true
+              echo
+              echo "[Full diff](https://github.com/$SOURCE_REPO/compare/$PREV_SHA...$SHA)"
+            fi
+          } > nightly-notes.md
+          gh release create "$TAG" "$APK" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Nightly $VERSION_NAME" \
+            --prerelease \
+            --notes-file nightly-notes.md
+          echo "Published $TAG"
